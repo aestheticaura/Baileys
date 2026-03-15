@@ -12,6 +12,7 @@ import type {
 	RequestJoinMethod,
 	SignalKeyStoreWithTransaction,
 	SignalRepositoryWithLIDStore,
+	SocketConfig,
 	WAMessage,
 	WAMessageKey
 } from '../Types'
@@ -23,12 +24,13 @@ import {
 	isHostedPnUser,
 	isJidBroadcast,
 	isJidStatusBroadcast,
+	isLidUser,
 	jidDecode,
 	jidEncode,
 	jidNormalizedUser
 } from '../WABinary'
 import { aesDecryptGCM, hmacSign } from './crypto'
-import { toNumber } from './generics'
+import { getKeyAuthor, toNumber } from './generics'
 import { downloadAndProcessHistorySyncNotification } from './history'
 import type { ILogger } from './logger'
 
@@ -41,6 +43,7 @@ type ProcessMessageContext = {
 	logger?: ILogger
 	options: RequestInit
 	signalRepository: SignalRepositoryWithLIDStore
+	getMessage: SocketConfig['getMessage']
 }
 
 const REAL_MSG_STUB_TYPES = new Set([
@@ -144,6 +147,17 @@ type PollContext = {
 	voterJid: string
 }
 
+type EventContext = {
+	/** normalised jid of the person that created the event */
+	eventCreatorJid: string
+	/** ID of the event creation message */
+	eventMsgId: string
+	/** event creation message enc key */
+	eventEncKey: Uint8Array
+	/** jid of the person that responded */
+	responderJid: string
+}
+
 /**
  * Decrypt a poll vote
  * @param vote encrypted vote
@@ -174,6 +188,36 @@ export function decryptPollVote(
 	}
 }
 
+/**
+ * Decrypt an event response
+ * @param response encrypted event response
+ * @param ctx additional info about the event required for decryption
+ * @returns event response message
+ */
+export function decryptEventResponse(
+	{ encPayload, encIv }: proto.Message.IPollEncValue,
+	{ eventCreatorJid, eventMsgId, eventEncKey, responderJid }: EventContext
+) {
+	const sign = Buffer.concat([
+		toBinary(eventMsgId),
+		toBinary(eventCreatorJid),
+		toBinary(responderJid),
+		toBinary('Event Response'),
+		new Uint8Array([1])
+	])
+
+	const key0 = hmacSign(eventEncKey, new Uint8Array(32), 'sha256')
+	const decKey = hmacSign(sign, key0, 'sha256')
+	const aad = toBinary(`${eventMsgId}\u0000${responderJid}`)
+
+	const decrypted = aesDecryptGCM(encPayload!, decKey, encIv!, aad)
+	return proto.Message.EventResponseMessage.decode(decrypted)
+
+	function toBinary(txt: string) {
+		return Buffer.from(txt)
+	}
+}
+
 const processMessage = async (
 	message: WAMessage,
 	{
@@ -184,7 +228,8 @@ const processMessage = async (
 		signalRepository,
 		keyStore,
 		logger,
-		options
+		options,
+		getMessage
 	}: ProcessMessageContext
 ) => {
 	const meId = creds.me!.id
@@ -240,7 +285,14 @@ const processMessage = async (
 						})
 					}
 
-					const data = await downloadAndProcessHistorySyncNotification(histNotification, options)
+					const data = await downloadAndProcessHistorySyncNotification(histNotification, options, logger)
+
+					if (data.lidPnMappings?.length) {
+						logger?.debug({ count: data.lidPnMappings.length }, 'processing LID-PN mappings from history sync')
+						await signalRepository.lidMapping
+							.storeLIDPNMappings(data.lidPnMappings)
+							.catch(err => logger?.warn({ err }, 'failed to store LID-PN mappings from history sync'))
+					}
 
 					ev.emit('messaging-history.set', {
 						...data,
@@ -294,23 +346,51 @@ const processMessage = async (
 			case proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
 				const response = protocolMsg.peerDataOperationRequestResponseMessage!
 				if (response) {
-					await placeholderResendCache?.del(response.stanzaId!)
 					// TODO: IMPLEMENT HISTORY SYNC ETC (sticker uploads etc.).
-					const { peerDataOperationResult } = response
-					for (const result of peerDataOperationResult!) {
-						const { placeholderMessageResendResponse: retryResponse } = result
+					const peerDataOperationResult = response.peerDataOperationResult || []
+					for (const result of peerDataOperationResult) {
+						const retryResponse = result?.placeholderMessageResendResponse
 						//eslint-disable-next-line max-depth
-						if (retryResponse) {
-							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes!)
-							// wait till another upsert event is available, don't want it to be part of the PDO response message
-							// TODO: parse through proper message handling utilities (to add relevant key fields)
-							setTimeout(() => {
-								ev.emit('messages.upsert', {
-									messages: [webMessageInfo as WAMessage],
-									type: 'notify',
-									requestId: response.stanzaId!
-								})
-							}, 500)
+						if (!retryResponse?.webMessageInfoBytes) {
+							continue
+						}
+
+						//eslint-disable-next-line max-depth
+						try {
+							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes)
+							const msgId = webMessageInfo.key?.id
+							// Retrieve cached original message data (preserves LID details,
+							// timestamps, etc. that the phone may omit in its PDO response)
+							const cachedData = msgId ? await placeholderResendCache?.get<Partial<WAMessage> | true>(msgId) : undefined
+							//eslint-disable-next-line max-depth
+							if (msgId) {
+								await placeholderResendCache?.del(msgId)
+							}
+
+							let finalMsg: WAMessage
+							//eslint-disable-next-line max-depth
+							if (cachedData && typeof cachedData === 'object') {
+								// Apply decoded message content onto cached metadata (preserves LID etc.)
+								cachedData.message = webMessageInfo.message
+								//eslint-disable-next-line max-depth
+								if (webMessageInfo.messageTimestamp) {
+									cachedData.messageTimestamp = webMessageInfo.messageTimestamp
+								}
+
+								finalMsg = cachedData as WAMessage
+							} else {
+								finalMsg = webMessageInfo as WAMessage
+							}
+
+							logger?.debug({ msgId, requestId: response.stanzaId }, 'received placeholder resend')
+
+							ev.emit('messages.upsert', {
+								messages: [finalMsg],
+								type: 'notify',
+								requestId: response.stanzaId!
+							})
+						} catch (err) {
+							logger?.warn({ err, stanzaId: response.stanzaId }, 'failed to decode placeholder resend response')
 						}
 					}
 				}
@@ -333,6 +413,19 @@ const processMessage = async (
 						}
 					}
 				])
+				break
+			case proto.Message.ProtocolMessage.Type.GROUP_MEMBER_LABEL_CHANGE:
+				const labelAssociationMsg = protocolMsg.memberLabel
+				if (labelAssociationMsg?.label) {
+					ev.emit('group.member-tag.update', {
+						groupId: chat.id!,
+						label: labelAssociationMsg.label,
+						participant: message.key.participant!,
+						participantAlt: message.key.participantAlt!,
+						messageTimestamp: Number(message.messageTimestamp)
+					})
+				}
+
 				break
 			case proto.Message.ProtocolMessage.Type.LID_MIGRATION_MAPPING_SYNC:
 				const encodedPayload = protocolMsg.lidMigrationMappingSyncMessage?.encodedMappingPayload!
@@ -363,6 +456,60 @@ const processMessage = async (
 				key: content.reactionMessage?.key!
 			}
 		])
+	} else if (content?.encEventResponseMessage) {
+		const encEventResponse = content.encEventResponseMessage
+		const creationMsgKey = encEventResponse.eventCreationMessageKey!
+
+		// we need to fetch the event creation message to get the event enc key
+		const eventMsg = await getMessage(creationMsgKey)
+		if (eventMsg) {
+			try {
+				const meIdNormalised = jidNormalizedUser(meId)
+
+				// all jids need to be PN
+				const eventCreatorKey = creationMsgKey.participant || creationMsgKey.remoteJid!
+				const eventCreatorPn = isLidUser(eventCreatorKey)
+					? await signalRepository.lidMapping.getPNForLID(eventCreatorKey)
+					: eventCreatorKey
+				const eventCreatorJid = getKeyAuthor(
+					{ remoteJid: jidNormalizedUser(eventCreatorPn!), fromMe: meIdNormalised === eventCreatorPn },
+					meIdNormalised
+				)
+
+				const responderJid = getKeyAuthor(message.key, meIdNormalised)
+				const eventEncKey = eventMsg?.messageContextInfo?.messageSecret
+
+				if (!eventEncKey) {
+					logger?.warn({ creationMsgKey }, 'event response: missing messageSecret for decryption')
+				} else {
+					const responseMsg = decryptEventResponse(encEventResponse, {
+						eventEncKey,
+						eventCreatorJid,
+						eventMsgId: creationMsgKey.id!,
+						responderJid
+					})
+
+					const eventResponse = {
+						eventResponseMessageKey: message.key,
+						senderTimestampMs: responseMsg.timestampMs!,
+						response: responseMsg
+					}
+
+					ev.emit('messages.update', [
+						{
+							key: creationMsgKey,
+							update: {
+								eventResponses: [eventResponse]
+							}
+						}
+					])
+				}
+			} catch (err) {
+				logger?.warn({ err, creationMsgKey }, 'failed to decrypt event response')
+			}
+		} else {
+			logger?.warn({ creationMsgKey }, 'event creation message not found, cannot decrypt response')
+		}
 	} else if (message.messageStubType) {
 		const jid = message.key?.remoteJid!
 		//let actor = whatsappID (message.participant)

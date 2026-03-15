@@ -1,5 +1,7 @@
-/* @ts-ignore */
+// @ts-ignore
 import * as libsignal from 'libsignal'
+// @ts-ignore
+import { PreKeyWhisperMessage } from 'libsignal/src/protobufs'
 import { LRUCache } from 'lru-cache'
 import type { LIDMapping, SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepositoryWithLIDStore } from '../Types/Signal'
@@ -20,6 +22,31 @@ import { SenderKeyRecord } from './Group/sender-key-record'
 import { GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage } from './Group'
 import { LIDMappingStore } from './lid-mapping'
 
+/** Extract identity key from PreKeyWhisperMessage for identity change detection */
+function extractIdentityFromPkmsg(ciphertext: Uint8Array): Uint8Array | undefined {
+	try {
+		if (!ciphertext || ciphertext.length < 2) {
+			return undefined
+		}
+
+		// Version byte check (version 3)
+		const version = ciphertext[0]!
+		if ((version & 0xf) !== 3) {
+			return undefined
+		}
+
+		// Parse protobuf (skip version byte)
+		const preKeyProto = PreKeyWhisperMessage.decode(ciphertext.slice(1))
+		if (preKeyProto.identityKey?.length === 33) {
+			return new Uint8Array(preKeyProto.identityKey)
+		}
+
+		return undefined
+	} catch {
+		return undefined
+	}
+}
+
 export function makeLibSignalRepository(
 	auth: SignalAuthState,
 	logger: ILogger,
@@ -30,7 +57,7 @@ export function makeLibSignalRepository(
 
 	const parsedKeys = auth.keys as SignalKeyStoreWithTransaction
 	const migratedSessionCache = new LRUCache<string, true>({
-		ttl: 7 * 24 * 60 * 60 * 1000, // 7 days
+		ttl: 3 * 24 * 60 * 60 * 1000, // 7 days
 		ttlAutopurge: true,
 		updateAgeOnGet: true
 	})
@@ -78,6 +105,18 @@ export function makeLibSignalRepository(
 		async decryptMessage({ jid, type, ciphertext }) {
 			const addr = jidToSignalProtocolAddress(jid)
 			const session = new libsignal.SessionCipher(storage, addr)
+
+			// Extract and save sender's identity key before decryption for identity change detection
+			if (type === 'pkmsg') {
+				const identityKey = extractIdentityFromPkmsg(ciphertext)
+				if (identityKey) {
+					const addrStr = addr.toString()
+					const identityChanged = await storage.saveIdentity(addrStr, identityKey)
+					if (identityChanged) {
+						logger.info({ jid, addr: addrStr }, 'identity key changed or new contact, session will be re-established')
+					}
+				}
+			}
 
 			async function doDecrypt() {
 				let result: Buffer
@@ -359,7 +398,11 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 function signalStorage(
 	{ creds, keys }: SignalAuthState,
 	lidMapping: LIDMappingStore
-): SenderKeyStore & libsignal.SignalStorage {
+): SenderKeyStore &
+	libsignal.SignalStorage & {
+		loadIdentityKey(id: string): Promise<Uint8Array | undefined>
+		saveIdentity(id: string, identityKey: Uint8Array): Promise<boolean>
+	} {
 	// Shared function to resolve PN signal address to LID if mapping exists
 	const resolveLIDSignalAddress = async (id: string): Promise<string> => {
 		if (id.includes('.')) {
@@ -401,7 +444,38 @@ function signalStorage(
 			await keys.set({ session: { [wireJid]: session.serialize() } })
 		},
 		isTrustedIdentity: () => {
-			return true // todo: implement
+			return true // TOFU - Trust on First Use (same as WhatsApp Web)
+		},
+		loadIdentityKey: async (id: string) => {
+			const wireJid = await resolveLIDSignalAddress(id)
+			const { [wireJid]: key } = await keys.get('identity-key', [wireJid])
+			return key || undefined
+		},
+		saveIdentity: async (id: string, identityKey: Uint8Array): Promise<boolean> => {
+			const wireJid = await resolveLIDSignalAddress(id)
+			const { [wireJid]: existingKey } = await keys.get('identity-key', [wireJid])
+
+			const keysMatch =
+				existingKey &&
+				existingKey.length === identityKey.length &&
+				existingKey.every((byte, i) => byte === identityKey[i])
+
+			if (existingKey && !keysMatch) {
+				// Identity changed - clear session and update key
+				await keys.set({
+					session: { [wireJid]: null },
+					'identity-key': { [wireJid]: identityKey }
+				})
+				return true
+			}
+
+			if (!existingKey) {
+				// New contact - Trust on First Use (TOFU)
+				await keys.set({ 'identity-key': { [wireJid]: identityKey } })
+				return true
+			}
+
+			return false
 		},
 		loadPreKey: async (id: number | string) => {
 			const keyId = id.toString()
